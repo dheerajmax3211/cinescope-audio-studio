@@ -1,0 +1,29 @@
+# Build products and app bundles
+build/
+DerivedData/
+*.app/
+*.zip
+
+# Local model/runtime downloads
+.venv/
+StableAudio/
+models/
+*.npz
+
+# Generated media and project data
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.aac
+project.json
+
+# Credentials and local settings
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# macOS metadata
+.DS_Store
