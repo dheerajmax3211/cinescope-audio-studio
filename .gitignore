@@ -6,7 +6,7 @@ DerivedData/
 
 # Local model/runtime downloads
 .venv/
-StableAudio/
+/StableAudio/
 models/
 *.npz
 

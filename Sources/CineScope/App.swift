@@ -38,7 +38,28 @@ struct AudioClip: Identifiable, Codable, Hashable {
     var createdAt: Date = Date()
     var gain: Double = 1
     var offset: Double = 0
+    var trimStart: Double? = nil
+    var trimEnd: Double? = nil
+    var fadeIn: Double? = nil
+    var fadeOut: Double? = nil
+    var pan: Double? = nil
+    var stereoBalance: Double? = nil
+    var muted: Bool? = nil
+    var solo: Bool? = nil
+    var lowEQ: Double? = nil
+    var midEQ: Double? = nil
+    var highEQ: Double? = nil
+    var compression: Double? = nil
+    var room: Double? = nil
+    var delay: Double? = nil
+    var volumeAutomation: [VolumeAutomationPoint]? = nil
     var url: URL { URL(fileURLWithPath: filename) }
+}
+
+struct VolumeAutomationPoint: Identifiable, Codable, Hashable {
+    var id: UUID = UUID()
+    var seconds: Double
+    var gain: Double
 }
 
 @MainActor
@@ -54,6 +75,12 @@ final class StudioModel: ObservableObject {
     @Published var activeClipID: UUID?
     @Published var playbackTime = 0.0
     @Published var playbackDuration = 0.0
+    @Published var isExporting = false
+    @Published var canUndo = false
+    @Published var mixMeterSummary = ""
+    @Published var referenceVideoURL: URL?
+    @Published var videoPlayer: AVPlayer?
+    @Published var sceneMarkers: [SceneMarker] = []
     @Published var voices: [String] = [
         "🇮🇳 Kabir (Warm Indian Male - Conversational)",
         "🇮🇳 Dev (Calm Indian Male - Storyteller / Narrator)",
@@ -105,12 +132,19 @@ final class StudioModel: ObservableObject {
     @Published var candidateCount = 1.0
     @Published var noiseCleanupEnabled = false
     @Published var currentWorkspaceName = "Untitled Film"
+    @Published var exportSampleRate = 48000.0
+    @Published var exportBitDepth = "24-bit PCM"
+    @Published var loudnessTarget = "Off"
 
     private let baseService = URL(string: "http://127.0.0.1:5070")!
     private let fm = FileManager.default
     private var voiceServiceProcess: Process?
     private var playbackObserver: Any?
+    private var undoHistory: [[AudioClip]] = []
+    private var lastUndoCapture = Date.distantPast
+    private var videoBaseTime = 0.0
     private var clipMetaURL: URL { workspaceURL.appendingPathComponent("project.json") }
+    private var workspaceStateURL: URL { workspaceURL.appendingPathComponent("workspace-state.json") }
     private var audioDir: URL { workspaceURL.appendingPathComponent("Audio", isDirectory: true) }
     var sourceClips: [AudioClip] { clips.filter { ["Music", "Sound FX", "Import", "Mixdown"].contains($0.kind) } }
     var selectedSourceDuration: Double {
@@ -129,6 +163,7 @@ final class StudioModel: ObservableObject {
         currentWorkspaceName = initial.lastPathComponent
         openRouterAPIKey = loadOpenRouterKey()
         loadProject()
+        loadWorkspaceState()
         Task { await checkConnections() }
     }
 
@@ -252,7 +287,49 @@ final class StudioModel: ObservableObject {
             currentWorkspaceName = url.lastPathComponent
             ensureFolders()
             loadProject()
+            loadWorkspaceState()
         }
+    }
+
+    func importVideo(_ url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let folder = audioDir.appendingPathComponent("Video", isDirectory: true)
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            let destination = folder.appendingPathComponent(url.lastPathComponent)
+            if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+            try fm.copyItem(at: url, to: destination)
+            referenceVideoURL = destination
+            videoPlayer = AVPlayer(url: destination)
+            videoPlayer?.isMuted = true
+            saveWorkspaceState()
+            status = "Reference picture linked to the project"
+        } catch { errorMessage = "Could not import reference video: \(error.localizedDescription)" }
+    }
+
+    func addSceneMarker(_ title: String) {
+        let label = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let seconds = max(0, playbackTime + videoBaseTime)
+        let marker = SceneMarker(title: label.isEmpty ? "Marker \(sceneMarkers.count + 1)" : label, seconds: seconds)
+        sceneMarkers.append(marker)
+        sceneMarkers.sort { $0.seconds < $1.seconds }
+        saveWorkspaceState()
+    }
+
+    func removeSceneMarker(_ marker: SceneMarker) {
+        sceneMarkers.removeAll { $0.id == marker.id }
+        saveWorkspaceState()
+    }
+
+    var projectDuration: Double {
+        clips.filter { !($0.muted ?? false) }.map { clip in
+            max(0, clip.offset) + max(0, (audioDuration(clip.url) ?? 0) - (clip.trimStart ?? 0) - (clip.trimEnd ?? 0))
+        }.max() ?? 60
+    }
+
+    func clipDuration(_ clip: AudioClip) -> Double {
+        max(0.05, (audioDuration(clip.url) ?? 0) - (clip.trimStart ?? 0) - (clip.trimEnd ?? 0))
     }
 
     func saveOpenRouterKey() {
@@ -345,7 +422,7 @@ final class StudioModel: ObservableObject {
         let isMusic = kind == .music
         let prompt = (isMusic ? musicPrompt : fxPrompt).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { errorMessage = isMusic ? "Describe the music you want." : "Describe the sound effect or ambience."; return }
-        var seconds = isMusic ? Int(musicSeconds) : Int(fxSeconds)
+        var seconds = Double(isMusic ? Int(musicSeconds) : Int(fxSeconds))
         let editMode = isMusic ? musicEditMode : fxEditMode
         let sourceClip = clips.first(where: { $0.id == editSourceID })
         let tag = isMusic ? "Music" : "Sound FX"
@@ -357,8 +434,9 @@ final class StudioModel: ObservableObject {
             let folder = audioDir.appendingPathComponent(tag, isDirectory: true)
             try fm.createDirectory(at: folder, withIntermediateDirectories: true)
             let output = folder.appendingPathComponent("\(tag) \(timestamp()).wav")
-            var continuationMerge: (sourcePath: String, prefixSeconds: Double)?
-            var continuationSource: URL?
+            var segmentMerge: (sourcePath: String, prefixEnd: Double, suffixStart: Double)?
+            var temporaryFiles: [URL] = []
+            defer { temporaryFiles.forEach { try? fm.removeItem(at: $0) } }
             let useMedium = isMusic && musicQuality.hasPrefix("Cinematic")
             let dit = useMedium ? "medium" : (isMusic ? "sm-music" : "sm-sfx")
             let decoder = useMedium ? "same-l" : "same-s"
@@ -383,7 +461,7 @@ final class StudioModel: ObservableObject {
                     let prefixSeconds = max(0, sourceDuration - contextSeconds)
                     let generationSeconds = Int(ceil(contextSeconds + extensionSeconds))
                     guard generationSeconds <= 120 else { throw StudioError.message("One continuation can add up to 112 seconds on this local model. Continue the new output again for a longer cue.") }
-                    seconds = generationSeconds
+                    seconds = Double(generationSeconds)
                     let padded = folder.appendingPathComponent(".edit-source-\(UUID().uuidString).wav")
                     let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: { fm.isExecutableFile(atPath: $0) })
                     guard let ffmpeg else { throw StudioError.message("FFmpeg is required to prepare a continuation source. Install it with Homebrew (brew install ffmpeg).") }
@@ -391,19 +469,60 @@ final class StudioModel: ObservableObject {
                     let paddedResult = try await runProcess(executable: URL(fileURLWithPath: ffmpeg), arguments: padArgs, directory: folder, environment: environment)
                     guard paddedResult.status == 0, fm.fileExists(atPath: padded.path) else { throw StudioError.message("Could not prepare the padded continuation source.") }
                     initURL = padded
-                    continuationSource = padded
+                    temporaryFiles.append(padded)
                     let seam = max(0, contextSeconds - 1.5)
                     arguments += ["--init-audio", initURL.path, "--inpaint-range", String(format: "%.2f,%d", seam, generationSeconds)]
-                    continuationMerge = (sourceClip.filename, prefixSeconds)
+                    segmentMerge = (sourceClip.filename, prefixSeconds, sourceDuration)
                 } else if editMode == "Replace region" {
                     guard let sourceDuration = audioDuration(sourceClip.url), sourceDuration > 0 else { throw StudioError.message("Could not read the source clip duration.") }
                     let start = max(0, min(inpaintStart, sourceDuration - 0.1))
                     let end = max(start + 0.1, min(inpaintEnd, sourceDuration))
-                    seconds = Int(ceil(sourceDuration))
-                    arguments += ["--init-audio", initURL.path, "--inpaint-range", String(format: "%.2f,%.2f", start, end)]
+                    let targetFinalDuration = isMusic ? musicSeconds : fxSeconds
+                    let retainedDuration = sourceDuration - (end - start)
+                    let replacementDuration = targetFinalDuration - retainedDuration
+                    guard replacementDuration > 0.1 else { throw StudioError.message("The final cue length is shorter than the audio you are keeping. Increase the final length or extend the selected replacement range.") }
+                    let contextBefore = min(4.0, start)
+                    let contextAfter = min(4.0, max(0, sourceDuration - end))
+                    let contextStart = start - contextBefore
+                    let contextEnd = end + contextAfter
+                    seconds = contextBefore + replacementDuration + contextAfter
+                    let maximumSeconds = isMusic ? 120.0 : 30.0
+                    guard seconds <= maximumSeconds else { throw StudioError.message("This local model can render up to \(Int(maximumSeconds)) seconds per section. Reduce the final cue length or split this edit into more than one pass.") }
+                    guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: { fm.isExecutableFile(atPath: $0) }) else { throw StudioError.message("FFmpeg is required for length-changing region edits.") }
+                    let context = folder.appendingPathComponent(".replace-context-\(UUID().uuidString).wav")
+                    temporaryFiles.append(context)
+                    var filterParts: [String] = []
+                    var labels: [String] = []
+                    if contextBefore > 0.02 {
+                        filterParts.append("[0:a]atrim=start=\(String(format: "%.4f", contextStart)):end=\(String(format: "%.4f", start)),asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=stereo[pre]")
+                        labels.append("[pre]")
+                    }
+                    filterParts.append("anullsrc=r=44100:cl=stereo,atrim=duration=\(String(format: "%.4f", replacementDuration))[gap]")
+                    labels.append("[gap]")
+                    if contextAfter > 0.02 {
+                        filterParts.append("[0:a]atrim=start=\(String(format: "%.4f", end)):end=\(String(format: "%.4f", contextEnd)),asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=stereo[post]")
+                        labels.append("[post]")
+                    }
+                    filterParts.append("\(labels.joined())concat=n=\(labels.count):v=0:a=1[out]")
+                    let contextArgs = ["-y", "-i", sourceClip.filename, "-filter_complex", filterParts.joined(separator: ";"), "-map", "[out]", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", context.path]
+                    let contextResult = try await runProcess(executable: URL(fileURLWithPath: ffmpeg), arguments: contextArgs, directory: folder, environment: environment)
+                    guard contextResult.status == 0, fm.fileExists(atPath: context.path) else { throw StudioError.message("Could not prepare the region and its surrounding audio context.") }
+                    initURL = context
+                    let inpaintStartSeconds = contextBefore
+                    let inpaintEndSeconds = contextBefore + replacementDuration
+                    arguments += ["--init-audio", initURL.path, "--inpaint-range", String(format: "%.2f,%.2f", inpaintStartSeconds, inpaintEndSeconds)]
+                    segmentMerge = (sourceClip.filename, contextStart, contextEnd)
                 } else {
+                    let converted = folder.appendingPathComponent(".variation-source-\(UUID().uuidString).wav")
+                    temporaryFiles.append(converted)
+                    let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: { fm.isExecutableFile(atPath: $0) })
+                    guard let ffmpeg else { throw StudioError.message("FFmpeg is required to prepare a variation source.") }
+                    let convertArgs = ["-y", "-i", sourceClip.filename, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", converted.path]
+                    let convertedResult = try await runProcess(executable: URL(fileURLWithPath: ffmpeg), arguments: convertArgs, directory: folder, environment: environment)
+                    guard convertedResult.status == 0, fm.fileExists(atPath: converted.path) else { throw StudioError.message("Could not convert the source clip for a variation.") }
+                    initURL = converted
                     arguments += ["--init-audio", initURL.path, "--init-noise-level", String(format: "%.2f", variationStrength)]
-                    if editMode == "More like this" { seconds = Int(ceil(audioDuration(sourceClip.url) ?? Double(seconds))) }
+                    if editMode == "More like this" { seconds = audioDuration(sourceClip.url) ?? seconds }
                 }
             }
             if editMode == "Continue" {
@@ -412,13 +531,13 @@ final class StudioModel: ObservableObject {
             } else if editMode == "More like this" {
                 arguments += ["--prompt", "\(prompt). Create a related variation that keeps the source's overall style, instrumentation, tempo, and mood while introducing fresh melodic or textural details."]
             }
-            arguments += ["--seconds", "\(seconds)"]
+            arguments += ["--seconds", String(format: "%.3f", seconds)]
             let count = max(1, Int(candidateCount))
             var rendered: [AudioClip] = []
             for candidate in 1...count {
                 status = "Rendering \(isMusic ? "score" : "sound") · take \(candidate) of \(count)…"
                 let candidateURL = count == 1 ? output : folder.appendingPathComponent("\(tag) \(timestamp()) · Take \(candidate).wav")
-                let generationURL = continuationMerge == nil ? candidateURL : folder.appendingPathComponent(".continuation-\(UUID().uuidString).wav")
+                let generationURL = segmentMerge == nil ? candidateURL : folder.appendingPathComponent(".generated-segment-\(UUID().uuidString).wav")
                 var candidateArgs = arguments + ["--seed", "\(UInt32.random(in: 1...UInt32.max))"]
                 if let outIndex = candidateArgs.firstIndex(of: "--out"), outIndex + 1 < candidateArgs.count { candidateArgs[outIndex + 1] = generationURL.path }
                 let result = try await runProcess(executable: python, arguments: candidateArgs, directory: mlxFolder, environment: environment)
@@ -428,16 +547,24 @@ final class StudioModel: ObservableObject {
                     let needsAccess = ["401", "403", "gated", "access denied", "permission", "restricted"].contains(where: { lowerLog.contains($0) })
                     throw StudioError.message(needsAccess ? "Stable Audio access is blocked. In Settings → Engines & workspace, accept model access and connect Hugging Face, then retry." : "Local audio generation failed. \(log.suffix(700))")
                 }
-                if let continuationMerge {
-                    if continuationMerge.prefixSeconds > 0.01 {
-                        guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: { fm.isExecutableFile(atPath: $0) }) else { throw StudioError.message("FFmpeg is required to assemble the extended cue.") }
-                        let filter = "[0:a]atrim=start=0:end=\(String(format: "%.4f", continuationMerge.prefixSeconds)),asetpts=PTS-STARTPTS[prefix];[1:a]asetpts=PTS-STARTPTS[tail];[prefix][tail]concat=n=2:v=0:a=1[out]"
-                        let mergeArgs = ["-y", "-i", continuationMerge.sourcePath, "-i", generationURL.path, "-filter_complex", filter, "-map", "[out]", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", candidateURL.path]
-                        let merged = try await runProcess(executable: URL(fileURLWithPath: ffmpeg), arguments: mergeArgs, directory: folder, environment: environment)
-                        guard merged.status == 0, fm.fileExists(atPath: candidateURL.path) else { throw StudioError.message("The model rendered the continuation, but FFmpeg could not assemble it with the original cue.") }
-                    } else if generationURL != candidateURL {
-                        try fm.moveItem(at: generationURL, to: candidateURL)
+                if let segmentMerge {
+                    guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: { fm.isExecutableFile(atPath: $0) }) else { throw StudioError.message("FFmpeg is required to assemble the edited cue.") }
+                    var mergeParts: [String] = []
+                    var mergeLabels: [String] = []
+                    if segmentMerge.prefixEnd > 0.01 {
+                        mergeParts.append("[0:a]atrim=start=0:end=\(String(format: "%.4f", segmentMerge.prefixEnd)),asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=stereo[prefix]")
+                        mergeLabels.append("[prefix]")
                     }
+                    mergeParts.append("[1:a]asetpts=PTS-STARTPTS[edited]")
+                    mergeLabels.append("[edited]")
+                    if let sourceDuration = audioDuration(URL(fileURLWithPath: segmentMerge.sourcePath)), segmentMerge.suffixStart < sourceDuration - 0.01 {
+                        mergeParts.append("[0:a]atrim=start=\(String(format: "%.4f", segmentMerge.suffixStart)):end=\(String(format: "%.4f", sourceDuration)),asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=stereo[suffix]")
+                        mergeLabels.append("[suffix]")
+                    }
+                    mergeParts.append("\(mergeLabels.joined())concat=n=\(mergeLabels.count):v=0:a=1[out]")
+                    let mergeArgs = ["-y", "-i", segmentMerge.sourcePath, "-i", generationURL.path, "-filter_complex", mergeParts.joined(separator: ";"), "-map", "[out]", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", candidateURL.path]
+                    let merged = try await runProcess(executable: URL(fileURLWithPath: ffmpeg), arguments: mergeArgs, directory: folder, environment: environment)
+                    guard merged.status == 0, fm.fileExists(atPath: candidateURL.path) else { throw StudioError.message("The model generated the replacement, but FFmpeg could not assemble the cue around it.") }
                     try? fm.removeItem(at: generationURL)
                 }
                 if noiseCleanupEnabled {
@@ -453,8 +580,7 @@ final class StudioModel: ObservableObject {
                 addClip(clip)
                 rendered.append(clip)
             }
-            if let continuationSource { try? fm.removeItem(at: continuationSource) }
-            let renderedSeconds = rendered.last.flatMap { audioDuration($0.url) }.map { Int($0.rounded()) } ?? seconds
+            let renderedSeconds = rendered.last.flatMap { audioDuration($0.url) }.map { Int($0.rounded()) } ?? Int(seconds.rounded())
             status = "\(tag) rendered locally · \(renderedSeconds) sec · \(count) take\(count == 1 ? "" : "s")"
             if let last = rendered.last { play(last.url, id: last.id) }
         } catch { errorMessage = error.localizedDescription; status = "Local render failed" }
@@ -483,8 +609,22 @@ final class StudioModel: ObservableObject {
         activeClipID = id
         playbackTime = 0
         playbackDuration = audioDuration(url) ?? 0
+        videoBaseTime = clips.first(where: { $0.id == id })?.offset ?? 0
+        if let videoPlayer {
+            videoPlayer.seek(to: CMTime(seconds: videoBaseTime, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+            videoPlayer.play()
+        }
         playbackObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main) { [weak self] time in
-            Task { @MainActor in self?.playbackTime = max(0, time.seconds) }
+            Task { @MainActor in
+                guard let self else { return }
+                self.playbackTime = max(0, time.seconds)
+                if let video = self.videoPlayer {
+                    let desired = self.videoBaseTime + max(0, time.seconds)
+                    if abs(video.currentTime().seconds - desired) > 0.2 {
+                        video.seek(to: CMTime(seconds: desired, preferredTimescale: 600), toleranceBefore: CMTime(seconds: 0.05, preferredTimescale: 600), toleranceAfter: CMTime(seconds: 0.05, preferredTimescale: 600))
+                    }
+                }
+            }
         }
         player.play()
     }
@@ -496,7 +636,7 @@ final class StudioModel: ObservableObject {
         playbackTime = clamped
     }
 
-    func pausePlayback() { currentPlayer?.pause(); playingClip = nil }
+    func pausePlayback() { currentPlayer?.pause(); videoPlayer?.pause(); playingClip = nil }
 
     func formattedTime(_ time: Double) -> String {
         guard time.isFinite else { return "0:00" }
@@ -505,52 +645,221 @@ final class StudioModel: ObservableObject {
     }
 
     func togglePlayback(_ clip: AudioClip) {
-        if playingClip == clip.id { currentPlayer?.pause(); playingClip = nil }
+        if playingClip == clip.id { currentPlayer?.pause(); videoPlayer?.pause(); playingClip = nil }
         else { play(clip.url, id: clip.id) }
     }
 
-    func makeMixdown() {
+    func makeMixdown() async {
         guard !clips.isEmpty else { errorMessage = "Generate or import audio before creating a mix."; return }
-        guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: { fm.isExecutableFile(atPath: $0) }) else {
-            errorMessage = "FFmpeg is not installed. Install it with Homebrew (`brew install ffmpeg`) to render a mixdown."; return
-        }
+        let folder = audioDir.appendingPathComponent("Mixes", isDirectory: true)
         do {
-            let outputFolder = audioDir.appendingPathComponent("Mixes", isDirectory: true)
-            try fm.createDirectory(at: outputFolder, withIntermediateDirectories: true)
-            let output = outputFolder.appendingPathComponent("Mix \(timestamp()).wav")
-            var args: [String] = ["-y"]
-            let active = clips.filter { fm.fileExists(atPath: $0.filename) }
-            for clip in active { args += ["-i", clip.filename] }
-            var filters: [String] = []
-            for (index, clip) in active.enumerated() {
-                let delay = max(0, Int(clip.offset * 1000))
-                filters.append("[\(index):a]volume=\(String(format: "%.3f", clip.gain)),adelay=\(delay)|\(delay)[a\(index)]")
-            }
-            let labels = active.indices.map { "[a\($0)]" }.joined()
-            filters.append("\(labels)amix=inputs=\(active.count):duration=longest:normalize=0:dropout_transition=0,alimiter=limit=0.95[out]")
-            args += ["-filter_complex", filters.joined(separator: ";"), "-map", "[out]", "-ar", "48000", "-c:a", "pcm_s24le", output.path]
-            let proc = Process(); proc.executableURL = URL(fileURLWithPath: ffmpeg); proc.arguments = args
-            let pipe = Pipe(); proc.standardError = pipe; proc.standardOutput = Pipe()
-            try proc.run(); proc.waitUntilExit()
-            guard proc.terminationStatus == 0 else { throw StudioError.message("FFmpeg could not mix those clips. Check that each source file is valid audio.") }
+            isExporting = true
+            defer { isExporting = false }
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            let output = folder.appendingPathComponent("Mix \(timestamp()).wav")
+            let mix = selectedMixClips(from: clips)
+            guard !mix.isEmpty else { throw StudioError.message("All tracks are muted, or there are no mixable clips in the project.") }
+            try await renderMix(clips: mix, output: output)
+            mixMeterSummary = await measureMixLevels(output)
             let clip = AudioClip(name: output.deletingPathExtension().lastPathComponent, kind: "Mixdown", filename: output.path)
-            addClip(clip); status = "Mixdown exported as 24-bit / 48 kHz WAV"; play(output, id: clip.id)
+            addClip(clip); status = "Mixdown exported · \(Int(exportSampleRate)) Hz · \(exportBitDepth)"; play(output, id: clip.id)
         } catch { errorMessage = error.localizedDescription }
     }
 
+    func exportStems() async {
+        let sources = clips.filter { $0.kind != "Mixdown" && fm.fileExists(atPath: $0.filename) }
+        guard !sources.isEmpty else { errorMessage = "Generate or import audio before exporting stems."; return }
+        do {
+            isExporting = true
+            defer { isExporting = false }
+            let folder = audioDir.appendingPathComponent("Stems", isDirectory: true)
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            let groups = Dictionary(grouping: sources, by: { $0.kind }).sorted { $0.key < $1.key }
+            for (kind, group) in groups {
+                status = "Exporting \(kind) stem…"
+                let output = folder.appendingPathComponent("\(safeFilename(kind)) Stem \(timestamp()).wav")
+                try await renderMix(clips: group, output: output, applyTrackMuteAndSolo: false)
+            }
+            status = "\(groups.count) stems exported · \(Int(exportSampleRate)) Hz · \(exportBitDepth)"
+            NSWorkspace.shared.open(folder)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func previewTimeline() async {
+        let mix = selectedMixClips(from: clips)
+        guard !mix.isEmpty else { errorMessage = "There are no audible tracks in the timeline."; return }
+        do {
+            isExporting = true
+            status = "Preparing synchronized picture and sound preview…"
+            defer { isExporting = false }
+            let preview = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("CineScope-preview-\(UUID().uuidString).wav")
+            try await renderMix(clips: mix, output: preview, sampleRate: 48000, bitDepth: "16-bit PCM", loudness: "Off")
+            if let oldPlayer = currentPlayer { oldPlayer.pause(); if let observer = playbackObserver { oldPlayer.removeTimeObserver(observer); playbackObserver = nil } }
+            let player = AVPlayer(url: preview)
+            currentPlayer = player
+            currentPlayer?.volume = 1
+            playingClip = nil
+            activeClipID = nil
+            videoBaseTime = 0
+            playbackTime = 0
+            playbackDuration = audioDuration(preview) ?? projectDuration
+            await videoPlayer?.seek(to: .zero)
+            videoPlayer?.play()
+            playbackObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main) { [weak self] time in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.playbackTime = max(0, time.seconds)
+                    if let video = self.videoPlayer, abs(video.currentTime().seconds - time.seconds) > 0.2 {
+                        video.seek(to: CMTime(seconds: time.seconds, preferredTimescale: 600), toleranceBefore: CMTime(seconds: 0.05, preferredTimescale: 600), toleranceAfter: CMTime(seconds: 0.05, preferredTimescale: 600))
+                    }
+                }
+            }
+            player.play()
+            status = "Timeline preview playing"
+        } catch { errorMessage = "Could not prepare timeline preview: \(error.localizedDescription)" }
+    }
+
+    private func selectedMixClips(from clips: [AudioClip]) -> [AudioClip] {
+        let candidates = clips.filter { $0.kind != "Mixdown" && fm.fileExists(atPath: $0.filename) }
+        let solos = candidates.filter { $0.solo ?? false }
+        return (solos.isEmpty ? candidates : solos).filter { !($0.muted ?? false) }
+    }
+
+    private func renderMix(clips: [AudioClip], output: URL, sampleRate: Int? = nil, bitDepth: String? = nil, loudness: String? = nil, applyTrackMuteAndSolo: Bool = true) async throws {
+        guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: { fm.isExecutableFile(atPath: $0) }) else { throw StudioError.message("FFmpeg is not installed. Install it with Homebrew (brew install ffmpeg) to mix or export audio.") }
+        let active = applyTrackMuteAndSolo ? selectedMixClips(from: clips) : clips.filter { fm.fileExists(atPath: $0.filename) }
+        guard !active.isEmpty else { throw StudioError.message("There are no audible clips to mix.") }
+        var arguments = ["-y"]
+        for clip in active { arguments += ["-i", clip.filename] }
+        var filters: [String] = []
+        for (index, clip) in active.enumerated() {
+            let sourceDuration = audioDuration(clip.url) ?? 0
+            let trimStart = min(max(0, clip.trimStart ?? 0), max(0, sourceDuration - 0.02))
+            let trimEnd = min(sourceDuration, max(trimStart + 0.02, sourceDuration - max(0, clip.trimEnd ?? 0)))
+            let duration = max(0.02, trimEnd - trimStart)
+            var chain = ["atrim=start=\(String(format: "%.4f", trimStart)):end=\(String(format: "%.4f", trimEnd))", "asetpts=PTS-STARTPTS"]
+            let channels = audioChannelCount(clip.url)
+            if channels <= 1 {
+                let pan = min(1, max(-1, clip.pan ?? 0))
+                let left = cos((pan + 1) * Double.pi / 4)
+                let right = sin((pan + 1) * Double.pi / 4)
+                chain.append("pan=stereo|c0=\(String(format: "%.4f", left))*c0|c1=\(String(format: "%.4f", right))*c0")
+            } else {
+                let balance = min(1, max(-1, clip.stereoBalance ?? 0))
+                let left = balance > 0 ? 1 - balance : 1
+                let right = balance < 0 ? 1 + balance : 1
+                chain.append("pan=stereo|c0=\(String(format: "%.4f", left))*c0|c1=\(String(format: "%.4f", right))*c1")
+            }
+            for (frequency, gain) in [(120, clip.lowEQ ?? 0), (1000, clip.midEQ ?? 0), (8000, clip.highEQ ?? 0)] where abs(gain) >= 0.05 {
+                chain.append("equalizer=f=\(frequency):t=q:w=1:g=\(String(format: "%.2f", gain))")
+            }
+            let compression = min(1, max(0, clip.compression ?? 0))
+            if compression > 0.01 { chain.append("acompressor=threshold=-20dB:ratio=\(String(format: "%.2f", 1 + compression * 7)):attack=10:release=140:makeup=1") }
+            let room = min(0.8, max(0, clip.room ?? 0))
+            if room > 0.01 { chain.append("aecho=0.9:0.95:80:0.\(Int(room * 100))") }
+            let delay = min(1000, max(0, clip.delay ?? 0))
+            if delay > 0 { let milliseconds = Int(delay.rounded()); chain.append("adelay=\(milliseconds)|\(milliseconds)") }
+            let fadeIn = min(duration, max(0, clip.fadeIn ?? 0))
+            let fadeOut = min(duration, max(0, clip.fadeOut ?? 0))
+            if fadeIn > 0.01 { chain.append("afade=t=in:st=0:d=\(String(format: "%.3f", fadeIn))") }
+            if fadeOut > 0.01 { chain.append("afade=t=out:st=\(String(format: "%.3f", max(0, duration - fadeOut))):d=\(String(format: "%.3f", fadeOut))") }
+            if let points = clip.volumeAutomation, points.count >= 2 {
+                let expression = automationExpression(points.sorted { $0.seconds < $1.seconds })
+                chain.append("volume='\(expression)':eval=frame")
+            }
+            chain.append("volume=\(String(format: "%.4f", max(0, clip.gain)))")
+            let offset = max(0, Int(clip.offset * 1000))
+            chain.append("adelay=\(offset)|\(offset)")
+            filters.append("[\(index):a]\(chain.joined(separator: ","))[a\(index)]")
+        }
+        let labels = active.indices.map { "[a\($0)]" }.joined()
+        var master = "\(labels)amix=inputs=\(active.count):duration=longest:normalize=0:dropout_transition=0"
+        let targetLoudness = loudness ?? self.loudnessTarget
+        if targetLoudness == "EBU -23 LUFS" { master += ",loudnorm=I=-23:TP=-1.0:LRA=7" }
+        else if targetLoudness == "Streaming -14 LUFS" { master += ",loudnorm=I=-14:TP=-1.0:LRA=11" }
+        master += ",alimiter=limit=0.95[out]"
+        filters.append(master)
+        let rate = sampleRate ?? Int(exportSampleRate)
+        let depth = bitDepth ?? exportBitDepth
+        let codec = depth == "16-bit PCM" ? "pcm_s16le" : depth == "32-bit float" ? "pcm_f32le" : "pcm_s24le"
+        arguments += ["-filter_complex", filters.joined(separator: ";"), "-map", "[out]", "-ar", "\(rate)", "-c:a", codec, output.path]
+        let result = try await runProcess(executable: URL(fileURLWithPath: ffmpeg), arguments: arguments, directory: output.deletingLastPathComponent(), environment: ProcessInfo.processInfo.environment)
+        guard result.status == 0, fm.fileExists(atPath: output.path) else { throw StudioError.message("FFmpeg could not mix those clips. \(result.output.suffix(500))") }
+    }
+
+    private func measureMixLevels(_ url: URL) async -> String {
+        guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: { fm.isExecutableFile(atPath: $0) }) else { return "" }
+        guard let result = try? await runProcess(executable: URL(fileURLWithPath: ffmpeg), arguments: ["-hide_banner", "-i", url.path, "-af", "volumedetect", "-f", "null", "-"], directory: url.deletingLastPathComponent(), environment: ProcessInfo.processInfo.environment), result.status == 0 else { return "" }
+        let lines = result.output.split(separator: "\n").map(String.init)
+        let mean = lines.first(where: { $0.contains("mean_volume:") })?.components(separatedBy: "mean_volume:").last?.trimmingCharacters(in: .whitespaces)
+        let peak = lines.first(where: { $0.contains("max_volume:") })?.components(separatedBy: "max_volume:").last?.trimmingCharacters(in: .whitespaces)
+        guard let peak, let mean else { return "" }
+        return "Peak \(peak) · average \(mean)"
+    }
+
+    private func automationExpression(_ points: [VolumeAutomationPoint]) -> String {
+        guard let first = points.first, let last = points.last else { return "1" }
+        var expression = String(format: "%.4f", last.gain)
+        for index in stride(from: points.count - 2, through: 0, by: -1) {
+            let a = points[index], b = points[index + 1]
+            let span = max(0.001, b.seconds - a.seconds)
+            let interpolation = String(format: "%.4f+(%.4f-%.4f)*(t-%.4f)/%.4f", a.gain, b.gain, a.gain, a.seconds, span)
+            expression = "if(lt(t,\(String(format: "%.4f", b.seconds))),\(interpolation),\(expression))"
+        }
+        return "if(lt(t,\(String(format: "%.4f", first.seconds))),\(String(format: "%.4f", first.gain)),\(expression))"
+    }
+
+    private func audioChannelCount(_ url: URL) -> AVAudioChannelCount {
+        (try? AVAudioFile(forReading: url).processingFormat.channelCount) ?? 2
+    }
+
+    func addAutomationPoint(to clip: AudioClip, at seconds: Double? = nil) {
+        var updated = clips.first(where: { $0.id == clip.id }) ?? clip
+        let relativeTime = max(0, (seconds ?? playbackTime) - max(0, clip.offset))
+        var points = updated.volumeAutomation ?? []
+        points.append(VolumeAutomationPoint(seconds: relativeTime, gain: updated.gain))
+        updated.volumeAutomation = points.sorted { $0.seconds < $1.seconds }
+        updateClip(updated)
+    }
+
+    func updateAutomationPoint(_ point: VolumeAutomationPoint, for clip: AudioClip) {
+        var updated = clips.first(where: { $0.id == clip.id }) ?? clip
+        var points = updated.volumeAutomation ?? []
+        guard let index = points.firstIndex(where: { $0.id == point.id }) else { return }
+        points[index] = point
+        updated.volumeAutomation = points.sorted { $0.seconds < $1.seconds }
+        updateClip(updated)
+    }
+
+    func updateAutomationPoint(_ point: VolumeAutomationPoint, gain: Double, in clip: AudioClip) {
+        var updated = clips.first(where: { $0.id == clip.id }) ?? clip
+        var points = updated.volumeAutomation ?? []
+        guard let index = points.firstIndex(where: { $0.id == point.id }) else { return }
+        points[index].gain = gain
+        updated.volumeAutomation = points.sorted { $0.seconds < $1.seconds }
+        updateClip(updated)
+    }
+
+    func removeAutomationPoint(_ point: VolumeAutomationPoint, from clip: AudioClip) {
+        var updated = clips.first(where: { $0.id == clip.id }) ?? clip
+        updated.volumeAutomation?.removeAll { $0.id == point.id }
+        updateClip(updated)
+    }
+
     func removeClip(_ clip: AudioClip) {
+        recordUndo()
         clips.removeAll { $0.id == clip.id }
         saveProject()
     }
 
     func updateClip(_ clip: AudioClip) {
-        if let index = clips.firstIndex(where: { $0.id == clip.id }) { clips[index] = clip; saveProject() }
+        if let index = clips.firstIndex(where: { $0.id == clip.id }), clips[index] != clip { recordUndo(); clips[index] = clip; saveProject() }
     }
 
     func showOutputFolder() { NSWorkspace.shared.open(workspaceURL) }
 
     private func ensureFolders() {
-        for folder in ["Voice", "Music", "Sound FX", "Imports", "Mixes"] { try? fm.createDirectory(at: audioDir.appendingPathComponent(folder, isDirectory: true), withIntermediateDirectories: true) }
+        for folder in ["Voice", "Music", "Sound FX", "Imports", "Mixes", "Stems", "Video"] { try? fm.createDirectory(at: audioDir.appendingPathComponent(folder, isDirectory: true), withIntermediateDirectories: true) }
     }
     private func loadProject() {
         ensureFolders()
@@ -558,8 +867,37 @@ final class StudioModel: ObservableObject {
             clips = saved.filter { fm.fileExists(atPath: $0.filename) }.sorted { $0.createdAt > $1.createdAt }
         }
     }
-    private func addClip(_ clip: AudioClip) { clips.insert(clip, at: 0); saveProject() }
+    private func addClip(_ clip: AudioClip) { recordUndo(); clips.insert(clip, at: 0); saveProject() }
     private func saveProject() { if let data = try? JSONEncoder().encode(clips) { try? data.write(to: clipMetaURL, options: .atomic) } }
+    private func loadWorkspaceState() {
+        guard let data = try? Data(contentsOf: workspaceStateURL), let state = try? JSONDecoder().decode(WorkspaceState.self, from: data) else { return }
+        sceneMarkers = state.markers.sorted { $0.seconds < $1.seconds }
+        if let path = state.referenceVideoPath, fm.fileExists(atPath: path) {
+            let url = URL(fileURLWithPath: path)
+            referenceVideoURL = url
+            videoPlayer = AVPlayer(url: url)
+            videoPlayer?.isMuted = true
+        }
+    }
+    private func saveWorkspaceState() {
+        let state = WorkspaceState(referenceVideoPath: referenceVideoURL?.path, markers: sceneMarkers)
+        if let data = try? JSONEncoder().encode(state) { try? data.write(to: workspaceStateURL, options: .atomic) }
+    }
+    private func recordUndo() {
+        let now = Date()
+        guard now.timeIntervalSince(lastUndoCapture) > 0.35 else { return }
+        undoHistory.append(clips)
+        if undoHistory.count > 40 { undoHistory.removeFirst() }
+        lastUndoCapture = now
+        canUndo = true
+    }
+    func undoLastEdit() {
+        guard let previous = undoHistory.popLast() else { canUndo = false; return }
+        clips = previous
+        canUndo = !undoHistory.isEmpty
+        saveProject()
+        status = "Undid last timeline edit"
+    }
     private func locateSoundEngine() -> String {
         let candidates = [
             Bundle.main.resourceURL?.appendingPathComponent("StableAudio/optimized/mlx/sa3").path,
@@ -628,6 +966,17 @@ final class StudioModel: ObservableObject {
     }
 }
 
+struct SceneMarker: Identifiable, Codable, Hashable {
+    var id: UUID = UUID()
+    var title: String
+    var seconds: Double
+}
+
+struct WorkspaceState: Codable {
+    var referenceVideoPath: String?
+    var markers: [SceneMarker]
+}
+
 enum StudioError: LocalizedError {
     case unreachable
     case message(String)
@@ -638,6 +987,9 @@ struct StudioView: View {
     @StateObject private var model = StudioModel()
     @State private var showVoiceImporter = false
     @State private var showAudioImporter = false
+    @State private var showVideoImporter = false
+    @State private var markerDraft = "Scene marker"
+    @State private var timelineZoom = 28.0
     @State private var selectedClip: AudioClip?
     @State private var showSettings = false
 
@@ -666,6 +1018,7 @@ struct StudioView: View {
         .preferredColorScheme(.dark)
         .fileImporter(isPresented: $showVoiceImporter, allowedContentTypes: [.audio, .mp3, .wav], allowsMultipleSelection: false) { result in if case let .success(urls) = result, let url = urls.first { model.importReference(from: url) } }
         .fileImporter(isPresented: $showAudioImporter, allowedContentTypes: [.audio, .mp3, .wav], allowsMultipleSelection: false) { result in if case let .success(urls) = result, let url = urls.first { model.importAudio(url) } }
+        .fileImporter(isPresented: $showVideoImporter, allowedContentTypes: [.movie, .mpeg4Movie], allowsMultipleSelection: false) { result in if case let .success(urls) = result, let url = urls.first { model.importVideo(url) } }
         .sheet(isPresented: $showSettings) { settingsSheet }
         .alert("Something needs attention", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("OK", role: .cancel) { model.errorMessage = nil }
@@ -772,7 +1125,7 @@ struct StudioView: View {
                 HStack { sectionLabel("MUSIC BRIEF", detail: "Describe the scene, instrumentation, texture, and energy"); Spacer(); Text("LOCAL · APPLE SILICON").font(.system(size: 9, weight: .bold)).tracking(1).foregroundStyle(Color(hex: 0x77C4A1)) }
                 TextEditor(text: $model.musicPrompt).font(.system(size: 14, design: .serif)).scrollContentBackground(.hidden).foregroundStyle(Color(hex: 0xE9E5DE)).frame(minHeight: 150).padding(10).background(Color(hex: 0x141519), in: RoundedRectangle(cornerRadius: 10))
                 HStack(spacing: 18) {
-                    VStack(alignment: .leading, spacing: 8) { sectionLabel("LENGTH", detail: model.musicEditMode == "Continue" ? "Seconds to add" : "Seconds"); Slider(value: $model.musicSeconds, in: 10...(model.musicEditMode == "Continue" ? 112 : 120), step: 2).tint(Color(hex: 0xCDAA79)); Text("\(Int(model.musicSeconds)) sec\(model.musicEditMode == "Continue" ? " added" : "")").font(.system(size: 11, design: .monospaced)).foregroundStyle(.white.opacity(0.57)) }.frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 8) { sectionLabel(model.musicEditMode == "Replace region" ? "FINAL CUE LENGTH" : "LENGTH", detail: model.musicEditMode == "Continue" ? "Seconds to add" : model.musicEditMode == "Replace region" ? "Total output time" : "Seconds"); Slider(value: $model.musicSeconds, in: 10...(model.musicEditMode == "Continue" ? 112 : 120), step: 1).tint(Color(hex: 0xCDAA79)); Text("\(Int(model.musicSeconds)) sec\(model.musicEditMode == "Continue" ? " added" : model.musicEditMode == "Replace region" ? " total" : "")").font(.system(size: 11, design: .monospaced)).foregroundStyle(.white.opacity(0.57)) }.frame(maxWidth: .infinity, alignment: .leading)
                     VStack(alignment: .leading, spacing: 8) { sectionLabel("MODEL", detail: "Optimized for your M1 Pro"); HStack { Image(systemName: "cpu").foregroundStyle(Color(hex: 0xCDAA79)); Picker("Music quality", selection: $model.musicQuality) { Text(model.mediumModelAvailable ? "Cinematic · Medium" : "Cinematic · Medium (not installed)").tag("Cinematic · Medium").disabled(!model.mediumModelAvailable); Text("Fast · Small").tag("Fast · Small") }.labelsHidden().pickerStyle(.menu).font(.system(size: 12, weight: .medium)).padding(.top, 1) }.padding(.top, 6) }.frame(maxWidth: .infinity, alignment: .leading)
                 }
                 editControls(for: true)
@@ -796,7 +1149,7 @@ struct StudioView: View {
                 } label: { Label("Prompt examples", systemImage: "text.quote").font(.system(size: 10, weight: .medium)).foregroundStyle(Color(hex: 0xD8B98E)) }
                 Text("Describe what makes the sound, what moves against what, distance, space, and whether it is one action or a continuous bed. The examples below distinguish common concepts the model confuses.").font(.system(size: 10)).foregroundStyle(.white.opacity(0.42))
                 HStack(spacing: 18) {
-                    VStack(alignment: .leading, spacing: 8) { sectionLabel("LENGTH", detail: model.fxEditMode == "Continue" ? "Seconds to add" : "Seconds"); Slider(value: $model.fxSeconds, in: 2...30, step: 1).tint(Color(hex: 0xCDAA79)); Text("\(Int(model.fxSeconds)) sec\(model.fxEditMode == "Continue" ? " added" : "")").font(.system(size: 11, design: .monospaced)).foregroundStyle(.white.opacity(0.57)) }.frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 8) { sectionLabel(model.fxEditMode == "Replace region" ? "FINAL CLIP LENGTH" : "LENGTH", detail: model.fxEditMode == "Continue" ? "Seconds to add" : model.fxEditMode == "Replace region" ? "Total output time" : "Seconds"); Slider(value: $model.fxSeconds, in: 2...30, step: 1).tint(Color(hex: 0xCDAA79)); Text("\(Int(model.fxSeconds)) sec\(model.fxEditMode == "Continue" ? " added" : model.fxEditMode == "Replace region" ? " total" : "")").font(.system(size: 11, design: .monospaced)).foregroundStyle(.white.opacity(0.57)) }.frame(maxWidth: .infinity, alignment: .leading)
                     VStack(alignment: .leading, spacing: 8) { sectionLabel("MODEL", detail: "Local foley and ambience"); HStack { Image(systemName: "waveform.path.ecg").foregroundStyle(Color(hex: 0xCDAA79)); Text("Stable Audio 3 · Small SFX").font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.72)) }.padding(.top, 6) }.frame(maxWidth: .infinity, alignment: .leading)
                 }
                 editControls(for: false)
@@ -815,17 +1168,50 @@ struct StudioView: View {
                 statCard("\(model.clips.filter { $0.kind == "Music" || $0.kind == "Sound FX" }.count)", label: "SCORE & FOLEY", icon: "music.note")
             }
             panel {
-                HStack { sectionLabel("TIMELINE LAYERS", detail: "Set start offsets and levels; clips are mixed from their chosen start time"); Spacer(); Button { model.makeMixdown() } label: { Label("Export mixdown", systemImage: "square.and.arrow.down").font(.system(size: 11, weight: .semibold)).foregroundStyle(Color(hex: 0x171615)).padding(.horizontal, 13).padding(.vertical, 9).background(Color(hex: 0xD9B98D), in: RoundedRectangle(cornerRadius: 8)) }.buttonStyle(.plain).disabled(model.clips.isEmpty) }
+                HStack { sectionLabel("FILM TIMELINE", detail: "Arrange, trim, balance, process, and export synchronized audio"); Spacer(); Button { model.undoLastEdit() } label: { Label("Undo", systemImage: "arrow.uturn.backward") }.buttonStyle(SoftButtonStyle()).disabled(!model.canUndo); Button { showVideoImporter = true } label: { Label(model.referenceVideoURL == nil ? "Add picture" : "Replace picture", systemImage: "film").font(.system(size: 10, weight: .medium)) }.buttonStyle(SoftButtonStyle()); Button { Task { await model.previewTimeline() } } label: { Label("Play timeline", systemImage: "play.fill").font(.system(size: 10, weight: .medium)) }.buttonStyle(SoftButtonStyle()).disabled(model.clips.isEmpty || model.isExporting); Button { Task { await model.makeMixdown() } } label: { Label(model.isExporting ? "Exporting…" : "Export mix", systemImage: "square.and.arrow.down").font(.system(size: 10, weight: .semibold)).foregroundStyle(Color(hex: 0x171615)).padding(.horizontal, 12).padding(.vertical, 8).background(Color(hex: 0xD9B98D), in: RoundedRectangle(cornerRadius: 8)) }.buttonStyle(.plain).disabled(model.clips.isEmpty || model.isExporting) }
                 if model.clips.isEmpty { emptyWorkspace }
                 else {
-                    VStack(spacing: 0) {
-                        ForEach(model.clips) { clip in clipRow(clip) }
-                    }.background(Color(hex: 0x141519), in: RoundedRectangle(cornerRadius: 10))
-                    Text("Each layer can start at a different point. Export overlays the clips and saves a 24-bit WAV mix in Audio/Mixes.").font(.system(size: 10)).foregroundStyle(.white.opacity(0.38))
+                    if let player = model.videoPlayer { VideoPlayer(player: player).frame(height: 235).clipShape(RoundedRectangle(cornerRadius: 9)).overlay(alignment: .topLeading) { Label("REFERENCE PICTURE · MUTED", systemImage: "film").font(.system(size: 8, weight: .bold)).tracking(1).padding(8).background(.black.opacity(0.65), in: Capsule()).padding(8) } }
+                    HStack(spacing: 9) { Button { model.addSceneMarker(markerDraft) } label: { Label("Add marker at playhead", systemImage: "mappin.and.ellipse") }.buttonStyle(SoftButtonStyle()); TextField("Marker name", text: $markerDraft).textFieldStyle(.plain).font(.system(size: 10)).padding(8).background(Color(hex: 0x141519), in: RoundedRectangle(cornerRadius: 6)); Spacer(); Text("ZOOM").font(.system(size: 8, weight: .bold)).tracking(1).foregroundStyle(.white.opacity(0.4)); Slider(value: $timelineZoom, in: 12...64).frame(width: 100).tint(Color(hex: 0xD8B98E)) }
+                    timelineView
+                    VStack(spacing: 0) { ForEach(model.clips) { clip in clipRow(clip) } }.background(Color(hex: 0x141519), in: RoundedRectangle(cornerRadius: 10))
+                    HStack(spacing: 12) {
+                        exportPicker("RATE", selection: $model.exportSampleRate, options: [("48 kHz", 48000.0), ("96 kHz", 96000.0)])
+                        exportPicker("BIT DEPTH", selection: $model.exportBitDepth, options: [("16-bit PCM", "16-bit PCM"), ("24-bit PCM", "24-bit PCM"), ("32-bit float", "32-bit float")])
+                        exportPicker("LOUDNESS", selection: $model.loudnessTarget, options: [("Off", "Off"), ("Film · −23 LUFS", "EBU -23 LUFS"), ("Streaming · −14 LUFS", "Streaming -14 LUFS")])
+                        Spacer(); Button { Task { await model.exportStems() } } label: { Label("Export stems", systemImage: "square.stack.3d.up") }.buttonStyle(SoftButtonStyle()).disabled(model.clips.isEmpty || model.isExporting)
+                    }
+                    if !model.sceneMarkers.isEmpty { ScrollView(.horizontal, showsIndicators: false) { HStack { ForEach(model.sceneMarkers.sorted(by: { $0.seconds < $1.seconds })) { marker in HStack(spacing: 5) { Button("\(model.formattedTime(marker.seconds)) · \(marker.title)") { model.seekPlayback(to: marker.seconds) }.buttonStyle(.plain); Button { model.removeSceneMarker(marker) } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain) }.font(.system(size: 9)).foregroundStyle(Color(hex: 0xD8B98E)).padding(7).background(Color.white.opacity(0.05), in: Capsule()) } } } }
+                    if !model.mixMeterSummary.isEmpty { Label("LAST MIX LEVELS  ·  \(model.mixMeterSummary)", systemImage: "level3").font(.system(size: 9, weight: .medium, design: .monospaced)).foregroundStyle(Color(hex: 0x83C9AA)) }
+                    Text("Timeline preview mixes the active tracks and follows the muted reference picture. Export writes full quality PCM mix and per-category stems under Audio/.").font(.system(size: 10)).foregroundStyle(.white.opacity(0.38))
                 }
             }
             HStack { Button { model.selectWorkspace() } label: { Label("Change project folder", systemImage: "folder").font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.62)) }.buttonStyle(.plain); Spacer(); Button { model.showOutputFolder() } label: { Label("Open workspace in Finder", systemImage: "arrow.up.right.square").font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.62)) }.buttonStyle(.plain) }
         }
+    }
+
+    private var timelineView: some View {
+        let duration = max(10, model.projectDuration)
+        let width = max(760, duration * timelineZoom)
+        return ScrollView([.horizontal, .vertical]) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 0) { ForEach(0...Int(duration / 5), id: \.self) { tick in Text("\(tick * 5)s").font(.system(size: 8, design: .monospaced)).foregroundStyle(.white.opacity(0.35)).frame(width: timelineZoom * 5, alignment: .leading) } }.frame(width: width, height: 23, alignment: .leading)
+                ForEach(model.clips.filter { $0.kind != "Mixdown" }) { clip in
+                    ZStack(alignment: .leading) {
+                        Rectangle().fill(Color(hex: 0x111216))
+                        Rectangle().fill(colorFor(clip.kind).opacity(0.17)).frame(width: max(4, model.clipDuration(clip) * timelineZoom), height: 30).offset(x: max(0, clip.offset) * timelineZoom)
+                        WaveformStrip(url: clip.url, tint: colorFor(clip.kind)).frame(width: max(4, model.clipDuration(clip) * timelineZoom - 8), height: 22).offset(x: max(0, clip.offset) * timelineZoom + 4)
+                        HStack { Text(clip.name).font(.system(size: 8, weight: .medium)).lineLimit(1).padding(.leading, max(6, clip.offset * timelineZoom + 7)); Spacer() }.foregroundStyle(colorFor(clip.kind).opacity(0.75))
+                        ForEach(model.sceneMarkers) { marker in Rectangle().fill(Color(hex: 0xD8B98E).opacity(0.62)).frame(width: 1).offset(x: marker.seconds * timelineZoom) }
+                        if model.playbackDuration > 0 { Rectangle().fill(Color.white.opacity(0.8)).frame(width: 1.5).offset(x: (model.playbackTime + (model.activeClipID == nil ? 0 : (model.clips.first(where: { $0.id == model.activeClipID })?.offset ?? 0))) * timelineZoom) }
+                    }.frame(width: width, height: 35).contentShape(Rectangle()).gesture(SpatialTapGesture().onEnded { value in model.seekPlayback(to: max(0, value.location.x / timelineZoom)) })
+                }
+            }
+        }.frame(height: min(245, CGFloat(36 * max(1, model.clips.filter { $0.kind != "Mixdown" }.count) + 25))).background(Color(hex: 0x111216), in: RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.05), lineWidth: 1))
+    }
+
+    private func exportPicker<T: Hashable>(_ title: String, selection: Binding<T>, options: [(String, T)]) -> some View {
+        VStack(alignment: .leading, spacing: 3) { Text(title).font(.system(size: 8, weight: .bold)).tracking(1).foregroundStyle(.white.opacity(0.38)); Picker(title, selection: selection) { ForEach(Array(options.enumerated()), id: \.offset) { _, option in Text(option.0).tag(option.1) } }.labelsHidden().pickerStyle(.menu) }
     }
 
     private var latestOutput: some View {
@@ -898,10 +1284,13 @@ struct StudioView: View {
             }
             if mode.wrappedValue == "Replace region", model.editSourceID != nil {
                 VStack(alignment: .leading, spacing: 3) {
-                    sectionLabel("REGENERATE REGION", detail: "Everything outside this range is kept from the source")
+                    sectionLabel("REGENERATE REGION", detail: "Source range replaced; final cue duration is set above")
                     Slider(value: $model.inpaintStart, in: 0...max(0.1, model.selectedSourceDuration - 0.2), step: 0.1).tint(Color(hex: 0x8C88D8))
                     Slider(value: $model.inpaintEnd, in: max(0.1, model.inpaintStart + 0.1)...max(0.2, model.selectedSourceDuration), step: 0.1).tint(Color(hex: 0x8C88D8))
                     Text("\(model.formattedTime(model.inpaintStart)) – \(model.formattedTime(model.inpaintEnd))").font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.52))
+                    let target = music ? model.musicSeconds : model.fxSeconds
+                    let replacement = target - model.selectedSourceDuration + (model.inpaintEnd - model.inpaintStart)
+                    Text("New section ≈ \(model.formattedTime(replacement)) · finished cue ≈ \(model.formattedTime(target))").font(.system(size: 10, design: .monospaced)).foregroundStyle(Color(hex: 0xD8B98E))
                 }
             }
             if mode.wrappedValue == "Continue" { Text("The model regenerates the last 1.5 seconds as a seam, then creates the added section. Longer continuations are slower and may drift from the original cue.").font(.system(size: 10)).foregroundStyle(.white.opacity(0.4)) }
@@ -925,14 +1314,39 @@ struct StudioView: View {
                 Text("s").font(.system(size: 10)).foregroundStyle(.white.opacity(0.36))
                 Text("LEVEL").font(.system(size: 8, weight: .bold)).tracking(1).foregroundStyle(.white.opacity(0.3)).padding(.leading, 6)
                 Slider(value: binding(for: clip, keyPath: \.gain), in: 0...1.5).tint(colorFor(clip.kind)).frame(width: 80)
+                Button { boolBinding(for: clip, keyPath: \.muted).wrappedValue.toggle() } label: { Image(systemName: (clip.muted ?? false) ? "speaker.slash.fill" : "speaker.wave.2").foregroundStyle((clip.muted ?? false) ? Color.orange : Color.white.opacity(0.48)) }.buttonStyle(.plain).help("Mute track")
+                Button { boolBinding(for: clip, keyPath: \.solo).wrappedValue.toggle() } label: { Text("S").font(.system(size: 9, weight: .bold)).foregroundStyle((clip.solo ?? false) ? Color(hex: 0xD8B98E) : Color.white.opacity(0.42)).frame(width: 18, height: 18).background(Color.white.opacity((clip.solo ?? false) ? 0.15 : 0.04), in: Circle()) }.buttonStyle(.plain).help("Solo track")
                 Button { model.removeClip(clip) } label: { Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).foregroundStyle(.white.opacity(0.34)).padding(6) }.buttonStyle(.plain).help("Remove from project")
             }.padding(.horizontal, 12).padding(.vertical, 10)
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack { valueSlider("TRIM IN", value: optionalBinding(for: clip, keyPath: \.trimStart), range: 0...max(0.1, model.clipDuration(clip) - 0.1), suffix: "s"); valueSlider("TRIM TAIL", value: optionalBinding(for: clip, keyPath: \.trimEnd), range: 0...max(0.1, model.clipDuration(clip) - 0.1), suffix: "s") }
+                    HStack { valueSlider("FADE IN", value: optionalBinding(for: clip, keyPath: \.fadeIn), range: 0...10, suffix: "s"); valueSlider("FADE OUT", value: optionalBinding(for: clip, keyPath: \.fadeOut), range: 0...10, suffix: "s") }
+                    valueSlider(clip.kind == "Voice" || clip.kind == "Music" || clip.kind == "Sound FX" ? "PAN" : "STEREO BALANCE", value: optionalBinding(for: clip, keyPath: clip.kind == "Import" ? \.stereoBalance : \.pan), range: -1...1, suffix: "")
+                    HStack { valueSlider("LOW EQ · 120 HZ", value: optionalBinding(for: clip, keyPath: \.lowEQ), range: -12...12, suffix: " dB"); valueSlider("MID EQ · 1 KHZ", value: optionalBinding(for: clip, keyPath: \.midEQ), range: -12...12, suffix: " dB"); valueSlider("HIGH EQ · 8 KHZ", value: optionalBinding(for: clip, keyPath: \.highEQ), range: -12...12, suffix: " dB") }
+                    HStack { valueSlider("COMPRESSION", value: optionalBinding(for: clip, keyPath: \.compression), range: 0...1, suffix: ""); valueSlider("ROOM / ECHO", value: optionalBinding(for: clip, keyPath: \.room), range: 0...0.8, suffix: ""); valueSlider("DELAY", value: optionalBinding(for: clip, keyPath: \.delay), range: 0...1000, suffix: " ms") }
+                    HStack { Button { model.addAutomationPoint(to: clip, at: model.playbackTime) } label: { Label("Add level keyframe at playhead", systemImage: "point.topleft.down.curvedto.point.bottomright.up") }.buttonStyle(SoftButtonStyle()); Text("Automation keyframes: \(clip.volumeAutomation?.count ?? 0)").font(.system(size: 9)).foregroundStyle(.white.opacity(0.4)) }
+                    ForEach(clip.volumeAutomation ?? []) { point in HStack { Text("KEYFRAME").font(.system(size: 8, weight: .bold)).foregroundStyle(.white.opacity(0.36)); Slider(value: automationBinding(clip: clip, point: point), in: 0...2).tint(Color(hex: 0xD8B98E)); Text("\(point.seconds, specifier: "%.1f")s").font(.system(size: 9, design: .monospaced)); Button { model.removeAutomationPoint(point, from: clip) } label: { Image(systemName: "xmark") }.buttonStyle(.plain) } }
+                }.padding(.top, 9).padding(.horizontal, 12).padding(.bottom, 10)
+            } label: { Text("Track processing · trim, fades, stereo, EQ, dynamics, space, automation").font(.system(size: 9, weight: .medium)).foregroundStyle(.white.opacity(0.42)).padding(.horizontal, 12).padding(.bottom, 9) }.padding(.horizontal, 8)
             if clip.id != model.clips.last?.id { Rectangle().fill(Color.white.opacity(0.055)).frame(height: 1).padding(.leading, 48) }
         }
     }
 
     private func binding(for clip: AudioClip, keyPath: WritableKeyPath<AudioClip, Double>) -> Binding<Double> {
         Binding(get: { model.clips.first(where: { $0.id == clip.id })?[keyPath: keyPath] ?? clip[keyPath: keyPath] }, set: { value in var updated = model.clips.first(where: { $0.id == clip.id }) ?? clip; updated[keyPath: keyPath] = value; model.updateClip(updated) })
+    }
+    private func optionalBinding(for clip: AudioClip, keyPath: WritableKeyPath<AudioClip, Double?>) -> Binding<Double> {
+        Binding(get: { (model.clips.first(where: { $0.id == clip.id }) ?? clip)[keyPath: keyPath] ?? 0 }, set: { value in var updated = model.clips.first(where: { $0.id == clip.id }) ?? clip; updated[keyPath: keyPath] = value; model.updateClip(updated) })
+    }
+    private func boolBinding(for clip: AudioClip, keyPath: WritableKeyPath<AudioClip, Bool?>) -> Binding<Bool> {
+        Binding(get: { (model.clips.first(where: { $0.id == clip.id }) ?? clip)[keyPath: keyPath] ?? false }, set: { value in var updated = model.clips.first(where: { $0.id == clip.id }) ?? clip; updated[keyPath: keyPath] = value; model.updateClip(updated) })
+    }
+    private func automationBinding(clip: AudioClip, point: VolumeAutomationPoint) -> Binding<Double> {
+        Binding(get: { model.clips.first(where: { $0.id == clip.id })?.volumeAutomation?.first(where: { $0.id == point.id })?.gain ?? point.gain }, set: { model.updateAutomationPoint(point, gain: $0, in: clip) })
+    }
+    private func valueSlider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>, suffix: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) { HStack { Text(title).font(.system(size: 7, weight: .bold)).tracking(0.7).foregroundStyle(.white.opacity(0.42)); Spacer(); Text(String(format: "%.1f%@", value.wrappedValue, suffix)).font(.system(size: 8, design: .monospaced)).foregroundStyle(.white.opacity(0.5)) }; Slider(value: value, in: range).tint(Color(hex: 0xD8B98E)) }.frame(maxWidth: .infinity)
     }
     private func colorFor(_ kind: String) -> Color { if kind == "Voice" { Color(hex: 0xD5AA78) } else if kind == "Music" { Color(hex: 0x8C88D8) } else if kind == "Sound FX" { Color(hex: 0x79B9A4) } else { Color(hex: 0x9C9C9E) } }
     private func statCard(_ value: String, label: String, icon: String) -> some View {
@@ -1040,6 +1454,49 @@ struct StudioView: View {
                 await MainActor.run { model.installingAudio = false; model.errorMessage = error.localizedDescription; model.status = "Audio engine setup needs attention" }
             }
         }
+    }
+}
+
+private struct WaveformStrip: View {
+    let url: URL
+    let tint: Color
+    @State private var peaks: [CGFloat] = []
+
+    var body: some View {
+        Canvas { context, size in
+            guard !peaks.isEmpty else { return }
+            let step = size.width / CGFloat(peaks.count)
+            for (index, peak) in peaks.enumerated() {
+                let height = max(1, peak * size.height * 0.92)
+                let rect = CGRect(x: CGFloat(index) * step, y: (size.height - height) / 2, width: max(1, step * 0.52), height: height)
+                context.fill(Path(roundedRect: rect, cornerRadius: 1), with: .color(tint.opacity(0.85)))
+            }
+        }
+        .task(id: url) {
+            let source = url
+            peaks = await Task.detached(priority: .utility) { Self.readPeaks(source) }.value
+        }
+        .accessibilityLabel("Audio waveform")
+    }
+
+    nonisolated private static func readPeaks(_ url: URL) -> [CGFloat] {
+        guard let file = try? AVAudioFile(forReading: url) else { return [] }
+        let frames = file.length
+        guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 4096) else { return [] }
+        let bins = 96
+        var result: [CGFloat] = []
+        for bin in 0..<bins {
+            let start = AVAudioFramePosition(bin) * frames / AVAudioFramePosition(bins)
+            file.framePosition = start
+            let count = AVAudioFrameCount(min(4096, max(1, frames - start)))
+            guard (try? file.read(into: buffer, frameCount: count)) != nil, let channels = buffer.floatChannelData else { result.append(0.04); continue }
+            var peak: Float = 0
+            for channel in 0..<Int(buffer.format.channelCount) {
+                for frame in 0..<Int(buffer.frameLength) { peak = max(peak, abs(channels[channel][frame])) }
+            }
+            result.append(CGFloat(min(1, max(0.04, peak))))
+        }
+        return result
     }
 }
 

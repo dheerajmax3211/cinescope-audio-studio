@@ -16,5 +16,9 @@ xcrun swiftc \
   "$ROOT/Sources/CineScope/App.swift" \
   -o "$CONTENTS/MacOS/CineScope"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
+if [[ -d "$ROOT/Resources/StableAudio" ]]; then
+  mkdir -p "$CONTENTS/Resources/StableAudio"
+  cp -R "$ROOT/Resources/StableAudio/." "$CONTENTS/Resources/StableAudio/"
+fi
 codesign --force --deep --sign - "$APP"
 echo "Built $APP"
