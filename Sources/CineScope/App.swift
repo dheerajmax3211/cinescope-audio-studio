@@ -1028,7 +1028,7 @@ struct StudioView: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 11) {
-                ZStack { RoundedRectangle(cornerRadius: 10).fill(LinearGradient(colors: [Color(hex: 0xC59C69), Color(hex: 0xF0D6A9)], startPoint: .topLeading, endPoint: .bottomTrailing)); Image(systemName: "waveform.path").font(.system(size: 17, weight: .bold)).foregroundStyle(Color(hex: 0x161514)) }.frame(width: 36, height: 36)
+                Image("CineScopeLogo").resizable().scaledToFill().frame(width: 36, height: 36).clipShape(RoundedRectangle(cornerRadius: 9)).overlay(RoundedRectangle(cornerRadius: 9).stroke(Color.white.opacity(0.12), lineWidth: 0.7))
                 VStack(alignment: .leading, spacing: 2) { Text("CINESCOPE").font(.system(size: 13, weight: .bold, design: .rounded)).tracking(1.6); Text("AUDIO WORKSPACE").font(.system(size: 9, weight: .medium)).tracking(1.8).foregroundStyle(.white.opacity(0.42)) }
             }.padding(.horizontal, 20).padding(.top, 22).padding(.bottom, 30)
             Text("CREATE").font(.system(size: 10, weight: .bold)).tracking(1.7).foregroundStyle(.white.opacity(0.34)).padding(.horizontal, 20).padding(.bottom, 10)

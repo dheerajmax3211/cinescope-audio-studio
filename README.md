@@ -2,6 +2,8 @@
 
 A native macOS workspace for AI-assisted film audio: speech, score, sound effects, clip editing, and mixdown.
 
+CineScope's custom identity pairs a camera iris with an audio pulse, used in the workspace and macOS app icon.
+
 ## Build
 
 Requirements: macOS 13 or later and Xcode Command Line Tools.
